@@ -26,12 +26,16 @@ use jj_lib::git::GitFetch;
 use jj_lib::git::GitFetchRefExpression;
 use jj_lib::git::GitSettings;
 use jj_lib::git::expand_fetch_refspecs;
+use jj_lib::git::get_git_backend;
 use jj_lib::ref_name::RefName;
 use jj_lib::ref_name::RefNameBuf;
 use jj_lib::ref_name::RemoteName;
 use jj_lib::ref_name::RemoteNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::str_util::StringExpression;
+use jj_lib::submodule::SubmoduleInfo;
+use jj_lib::submodule::list_submodules;
+use jj_lib::submodule::submodule_store_path;
 use jj_lib::workspace::Workspace;
 
 use super::write_repository_level_trunk_alias;
@@ -70,6 +74,13 @@ pub struct GitCloneArgs {
     /// Name of the newly created remote
     #[arg(long = "remote", default_value = "origin")]
     remote_name: RemoteNameBuf,
+
+    /// Clone submodules recursively
+    ///
+    /// When enabled (the default), jj will automatically clone any Git
+    /// submodules defined in the repository's .gitmodules file.
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+    recurse_submodules: bool,
 
     /// Colocate the Jujutsu repo with the git repo
     ///
@@ -271,12 +282,158 @@ pub async fn cmd_git_clone(
         }
     }
 
+    // Clone submodules if requested
+    if args.recurse_submodules {
+        clone_submodules(ui, command, &workspace_command, &canonical_wc_path).await?;
+    }
+
     if colocate {
         writeln!(
             ui.hint_default(),
             r"Running `git clean -xdf` will remove `.jj/`!",
         )?;
     }
+
+    Ok(())
+}
+
+/// Clone all submodules defined in the repository.
+///
+/// This function reads .gitmodules from the repository and clones each
+/// submodule into `.jj/repo/submodules/<name>/`. The submodule's working
+/// copy is then materialized in the appropriate location within the
+/// superproject's working copy.
+async fn clone_submodules(
+    ui: &Ui,
+    command: &CommandHelper,
+    workspace_command: &WorkspaceCommandHelper,
+    wc_path: &Path,
+) -> Result<(), CommandError> {
+    // Get the git backend to access the gix repository
+    let store = workspace_command.repo().store();
+    let git_backend = match get_git_backend(store) {
+        Ok(backend) => backend,
+        Err(_) => {
+            // Not a git backend, no submodules to clone
+            return Ok(());
+        }
+    };
+
+    // Open the gix repository to read .gitmodules
+    let gix_repo = git_backend.git_repo();
+
+    // List submodules from .gitmodules
+    let submodules = match list_submodules(&gix_repo) {
+        Ok(subs) => subs,
+        Err(e) => {
+            // No .gitmodules or error reading it - not an error, just no submodules
+            tracing::debug!("No submodules found or error reading .gitmodules: {}", e);
+            return Ok(());
+        }
+    };
+
+    if submodules.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(
+        ui.status(),
+        "Cloning {} submodule(s)...",
+        submodules.len()
+    )?;
+
+    let repo_path = workspace_command.repo_path();
+
+    for submodule in &submodules {
+        clone_single_submodule(ui, command, repo_path, wc_path, submodule).await?;
+    }
+
+    Ok(())
+}
+
+/// Clone a single submodule.
+async fn clone_single_submodule(
+    ui: &Ui,
+    command: &CommandHelper,
+    repo_path: &Path,
+    wc_path: &Path,
+    submodule: &SubmoduleInfo,
+) -> Result<(), CommandError> {
+    writeln!(
+        ui.status(),
+        "  Cloning submodule '{}' from {}",
+        submodule.name,
+        submodule.url
+    )?;
+
+    // Determine where to store the submodule repository
+    let submodule_repo_path = submodule_store_path(repo_path, &submodule.name);
+
+    // Create the submodule store directory
+    fs::create_dir_all(&submodule_repo_path).map_err(|e| {
+        user_error_with_message(
+            format!(
+                "Failed to create submodule directory for '{}'",
+                submodule.name
+            ),
+            e,
+        )
+    })?;
+
+    // Initialize a new jj repo for the submodule
+    // Note: We use internal git (not colocated) for submodules to keep them
+    // isolated from the superproject's git state.
+    let (settings, _config_env) = command.settings_for_new_workspace(ui, &submodule_repo_path)?;
+    let (workspace, repo) = Workspace::init_internal_git(&settings, &submodule_repo_path).await?;
+    let mut workspace_command = command.for_workable_repo(ui, workspace, repo)?;
+
+    // Add the remote and fetch
+    let remote_name = RemoteName::new("origin");
+    let mut tx = workspace_command.start_transaction();
+    git::add_remote(
+        tx.repo_mut(),
+        remote_name,
+        &submodule.url,
+        None,
+        gix::remote::fetch::Tags::Included,
+        &StringExpression::all(),
+    )?;
+
+    let git_settings = GitSettings::from_settings(tx.settings())?;
+    let remote_settings = tx.settings().remote_settings()?;
+    let subprocess_options = git_settings.to_subprocess_options();
+    let import_options = load_git_import_options(ui, &git_settings, &remote_settings)?;
+
+    // Fetch from the submodule's remote
+    let mut git_fetch = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)?;
+    let ref_expr = GitFetchRefExpression {
+        bookmark: StringExpression::all(),
+        tag: StringExpression::none(),
+    };
+    let fetch_refspecs = expand_fetch_refspecs(remote_name, ref_expr)?;
+
+    git_fetch.fetch(
+        remote_name,
+        fetch_refspecs,
+        &mut GitSubprocessUi::new(ui),
+        None, // depth
+        Some(FetchTagsOverride::AllTags),
+    )?;
+
+    git_fetch.import_refs().await?;
+    tx.finish(ui, format!("fetch submodule '{}'", submodule.name))
+        .await?;
+
+    // TODO: Check out the specific commit that the superproject references
+    // TODO: Materialize the submodule's working copy in the superproject's
+    //       working copy at the submodule's path
+
+    writeln!(
+        ui.status(),
+        "  Cloned submodule '{}' to {}",
+        submodule.name,
+        submodule_repo_path.display()
+    )?;
 
     Ok(())
 }

@@ -105,6 +105,8 @@ pub mod ssh_signing;
 pub mod stacked_table;
 pub mod store;
 pub mod str_util;
+#[cfg(feature = "git")]
+pub mod submodule;
 pub mod submodule_store;
 #[cfg(feature = "testing")]
 pub mod test_signing_backend;
